@@ -11,13 +11,18 @@ import json
 import tarfile
 from os.path import isfile, join, getmtime
 
+import filelock
+
 from conda_build.utils import file_info
-from conda.compat import PY3
-from conda.utils import md5_file
+from .conda_interface import PY3, md5_file
 
 
-def read_index_tar(tar_path):
+def read_index_tar(tar_path, config, lock=None):
     """ Returns the index.json dict inside the given package tarball. """
+
+    if not lock:
+        lock = filelock.SoftFileLock(join(os.path.dirname(tar_path), ".conda_lock"))
+    lock.acquire(timeout=config.timeout)
     try:
         with tarfile.open(tar_path) as t:
             try:
@@ -28,11 +33,20 @@ def read_index_tar(tar_path):
             except OSError as e:
                 raise RuntimeError("Could not extract %s (%s)" % (tar_path, e))
     except tarfile.ReadError:
-        raise RuntimeError("Could not extract metadata from %s. File probably corrupt." % tar_path)
+        raise RuntimeError("Could not extract metadata from %s. "
+                            "File probably corrupt." % tar_path)
+    finally:
+        lock.release()
 
 
-def write_repodata(repodata, dir_path):
+def write_repodata(repodata, dir_path, config=None, lock=None):
     """ Write updated repodata.json and repodata.json.bz2 """
+    if not config:
+        import conda_build.config
+        config = conda_build.config.config
+    if not lock:
+        lock = filelock.SoftFileLock(join(dir_path, ".conda_lock"))
+    lock.acquire(timeout=config.timeout)
     data = json.dumps(repodata, indent=2, sort_keys=True)
     # strip trailing whitespace
     data = '\n'.join(line.rstrip() for line in data.splitlines())
@@ -43,9 +57,11 @@ def write_repodata(repodata, dir_path):
         fo.write(data)
     with open(join(dir_path, 'repodata.json.bz2'), 'wb') as fo:
         fo.write(bz2.compress(data.encode('utf-8')))
+    lock.release()
 
 
-def update_index(dir_path, verbose=False, force=False, check_md5=False, remove=True):
+def update_index(dir_path, config, force=False, check_md5=False, remove=True, lock=None,
+                 could_be_mirror=True):
     """
     Update all index files in dir_path with changed packages.
 
@@ -58,9 +74,17 @@ def update_index(dir_path, verbose=False, force=False, check_md5=False, remove=T
                       if a package changed.
     :type check_md5: bool
     """
-    if verbose:
+
+    if config.verbose:
         print("updating index in:", dir_path)
     index_path = join(dir_path, '.index.json')
+    if not os.path.isdir(dir_path):
+        os.makedirs(dir_path)
+
+    if not lock:
+        lock = filelock.SoftFileLock(join(dir_path, ".conda_lock"))
+    lock.acquire(timeout=config.timeout)
+
     if force:
         index = {}
     else:
@@ -72,11 +96,11 @@ def update_index(dir_path, verbose=False, force=False, check_md5=False, remove=T
             index = {}
 
     files = set(fn for fn in os.listdir(dir_path) if fn.endswith('.tar.bz2'))
-    if any(fn.startswith('_license-') for fn in files):
+    if could_be_mirror and any(fn.startswith('_license-') for fn in files):
         sys.exit("""\
 Error:
     Indexing a copy of the Anaconda conda package channel is neither
-    necessary nor supported.  If you which to add your own packages,
+    necessary nor supported.  If you wish to add your own packages,
     you can do so by adding them to a separate channel.
 """)
     for fn in files:
@@ -87,9 +111,9 @@ Error:
                     continue
             elif index[fn]['mtime'] == getmtime(path):
                 continue
-        if verbose:
+        if config.verbose:
             print('updating:', fn)
-        d = read_index_tar(path)
+        d = read_index_tar(path, config, lock=lock)
         d.update(file_info(path))
         index[fn] = d
 
@@ -99,7 +123,7 @@ Error:
     if remove:
         # remove files from the index which are not on disk
         for fn in set(index) - files:
-            if verbose:
+            if config.verbose:
                 print("removing:", fn)
             del index[fn]
 
@@ -121,4 +145,5 @@ Error:
             info['depends'] = info['requires']
 
     repodata = {'packages': index, 'info': {}}
-    write_repodata(repodata, dir_path)
+    write_repodata(repodata, dir_path, config, lock=lock)
+    lock.release()

@@ -1,13 +1,18 @@
 language: python
-python:
-  # We don't actually use the system Python but this keeps it organized.
-  - "2.7"
-  - "3.4"
-  - "3.5"
-env:
-  -
+matrix:
+  include:
+    - python: '2.7'
+      os: linux
+    - python: '3.5'
+      os: linux
+    # - python: '3.5'
+    #   env: CANARY=true
+    #   os: linux
+    - python: '3.5'
+      env: FLAKE8=true
+      os: linux
+
 install:
-  # TODO: Use a "latest" url
   - if [[ "$TRAVIS_PYTHON_VERSION" == "2.7" ]]; then
       wget http://repo.continuum.io/miniconda/Miniconda2-latest-Linux-x86_64.sh -O miniconda.sh;
     else
@@ -18,17 +23,41 @@ install:
   - hash -r
   - conda config --set always_yes yes
   - conda update -q --all
+  - if [[ "$CANARY" == "true" ]]; then
+      conda install -y -q -c conda-canary conda;
+      conda config --set always_yes yes;
+    fi
   - conda install -q --force --no-deps conda requests
-  - conda install -q pip pytest requests jinja2 patchelf flake8 python=$TRAVIS_PYTHON_VERSION pyflakes=1.1
-  - conda install -q anaconda-client conda-build
-  - pip install pytest-cov
-  - python setup.py install
+  - conda install -q anaconda-client requests filelock jinja2 patchelf python=$TRAVIS_PYTHON_VERSION pyflakes=1.1
+  - pip install pkginfo
+  - if [[ "$FLAKE8" == "true" ]]; then
+      conda install -q flake8;
+    else
+      conda install -c conda-forge -q perl;
+      conda install -q pytest pip pytest-cov numpy mock;
+      conda update -q --all;
+      $HOME/miniconda/bin/pip install pytest-xdist pytest-capturelog;
+      pushd .. && git clone https://github.com/conda/conda_build_test_recipe && popd;
+    fi
+  - pip install --no-deps .
   - conda info -a
 
 script:
-  - flake8 .
-  - py.test --cov conda_build --cov-report xml tests
-  - conda build --help
+  # flake8 and bdist_conda test together
+  - if [[ "$FLAKE8" == "true" ]]; then
+      flake8 .;
+      cp bdist_conda.py $HOME/miniconda/lib/python${TRAVIS_PYTHON_VERSION}/distutils/command;
+      pushd tests/bdist-recipe && python setup.py bdist_conda && popd;
+      conda build --help;
+      conda build conda.recipe --no-anaconda-upload -c conda-forge;
+      conda create -n _cbtest python=$TRAVIS_PYTHON_VERSION;
+      source activate _cbtest;
+      conda install $(conda render --output conda.recipe);
+      conda install filelock;
+      conda build conda.recipe --no-anaconda-upload -c conda-forge;
+    else
+      $HOME/miniconda/bin/py.test -v -n 2 --basetemp /tmp/cb --cov conda_build --cov-report xml tests;
+    fi
 
 notifications:
     flowdock: ef3821a08a791106512ccfc04c92eccb

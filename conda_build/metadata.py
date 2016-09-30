@@ -1,17 +1,21 @@
 from __future__ import absolute_import, division, print_function
 
+import logging
 import os
 import re
 import sys
-from os.path import isdir, isfile, join
+from os.path import isfile, join
 
-from conda.compat import iteritems, PY3, text_type
-from conda.utils import memoized, md5_file
-import conda.config as cc
-from conda.resolve import MatchSpec
-from conda.cli.common import specs_from_url
+from .conda_interface import iteritems, PY3, text_type
+from .conda_interface import memoized, md5_file
+from .conda_interface import non_x86_linux_machines, platform, arch_name
+from .conda_interface import MatchSpec
+from .conda_interface import specs_from_url
 
-from . import exceptions
+from conda_build import exceptions
+from conda_build.features import feature_list
+from conda_build.config import Config
+from conda_build.utils import rec_glob
 
 try:
     import yaml
@@ -25,13 +29,15 @@ except ImportError:
     sys.exit('Error: could not import yaml (required to read meta.yaml '
              'files of conda recipes)')
 
-from conda_build.config import config
 from conda_build.utils import comma_join
 
+on_win = (sys.platform == 'win32')
+log = logging.getLogger(__file__)
 
-def ns_cfg():
+
+def ns_cfg(config):
     # Remember to update the docs of any of this changes
-    plat = cc.subdir
+    plat = config.subdir
     py = config.CONDA_PY
     np = config.CONDA_NPY
     pl = config.CONDA_PERL
@@ -47,6 +53,8 @@ def ns_cfg():
         win=plat.startswith('win-'),
         win32=bool(plat == 'win-32'),
         win64=bool(plat == 'win-64'),
+        x86=plat.endswith(('-32', '-64')),
+        x86_64=plat.endswith('-64'),
         pl=pl,
         py=py,
         lua=lua,
@@ -62,20 +70,36 @@ def ns_cfg():
         os=os,
         environ=os.environ,
     )
-    for machine in cc.non_x86_linux_machines:
+    for machine in non_x86_linux_machines:
         d[machine] = bool(plat == 'linux-%s' % machine)
 
+    for feature, value in feature_list:
+        d[feature] = value
     d.update(os.environ)
     return d
 
 
-sel_pat = re.compile(r'(.+?)\s*(#.*)?\[(.+)\](?(2).*)$')
+# Selectors must be either:
+# - at end of the line
+# - embedded (anywhere) within a comment
+#
+# Notes:
+# - [([^\[\]]+)\] means "find a pair of brackets containing any
+#                 NON-bracket chars, and capture the contents"
+# - (?(2).*)$ means "allow trailing characters iff group 2 (#.*) was found."
+sel_pat = re.compile(r'(.+?)\s*(#.*)?\[([^\[\]]+)\](?(2).*)$')
 
 
 def select_lines(data, namespace):
     lines = []
+
     for i, line in enumerate(data.splitlines()):
         line = line.rstrip()
+
+        trailing_quote = ""
+        if line and line[-1] in ("'", '"'):
+            trailing_quote = line[-1]
+
         if line.lstrip().startswith('#'):
             # Don't bother with comment only lines
             continue
@@ -83,8 +107,10 @@ def select_lines(data, namespace):
         if m:
             cond = m.group(3)
             try:
+                # TODO: is there a way to do this without eval?  Eval allows arbitrary
+                #    code execution.
                 if eval(cond, namespace, {}):
-                    lines.append(m.group(1))
+                    lines.append(m.group(1) + trailing_quote)
             except:
                 sys.exit('''\
 Error: Invalid selector in meta.yaml line %d:
@@ -114,6 +140,7 @@ allowed_license_families = set("""
 AGPL
 Apache
 BSD
+GPL
 GPL2
 GPL3
 LGPL
@@ -145,8 +172,17 @@ def ensure_valid_fields(meta):
         raise RuntimeError("build/pin_depends cannot be '%s'" % pin_depends)
 
 
-def parse(data, path=None):
-    data = select_lines(data, ns_cfg())
+def ensure_valid_noarch_value(meta):
+    try:
+        build_noarch = meta['build']['noarch']
+    except KeyError:
+        return
+    if build_noarch.lower() == 'none':
+        raise exceptions.CondaBuildException("Invalid value for noarch: %s" % build_noarch)
+
+
+def parse(data, config, path=None):
+    data = select_lines(data, ns_cfg(config))
     res = yamlize(data)
     # ensure the result is a dict
     if res is None:
@@ -163,6 +199,7 @@ def parse(data, path=None):
 
     ensure_valid_fields(res)
     ensure_valid_license_family(res)
+    ensure_valid_noarch_value(res)
     return sanitize(res)
 
 
@@ -180,6 +217,7 @@ default_structs = {
     'requirements/conflicts': list,
     'test/requires': list,
     'test/files': list,
+    'test/source_files': list,
     'test/commands': list,
     'test/imports': list,
     'package/version': text_type,
@@ -195,6 +233,7 @@ default_structs = {
     'build/osx_is_app': bool,
     'build/preserve_egg_dir': bool,
     'build/binary_relocation': bool,
+    'build/noarch': text_type,
     'build/noarch_python': bool,
     'build/detect_binary_files_with_prefix': bool,
     'build/skip': bool,
@@ -264,11 +303,11 @@ FIELDS = {
                ],
     'build': ['number', 'string', 'entry_points', 'osx_is_app',
               'features', 'track_features', 'preserve_egg_dir',
-              'no_link', 'binary_relocation', 'script', 'noarch_python',
-              'has_prefix_files', 'binary_has_prefix_files', 'script_env',
-              'detect_binary_files_with_prefix', 'rpaths',
+              'no_link', 'binary_relocation', 'script', 'noarch', 'noarch_python',
+              'has_prefix_files', 'binary_has_prefix_files', 'ignore_prefix_files',
+              'detect_binary_files_with_prefix', 'rpaths', 'script_env',
               'always_include_files', 'skip', 'msvc_compiler',
-              'pin_depends'  # pin_depends is experimental still
+              'pin_depends', 'include_recipe'  # pin_depends is experimental still
               ],
     'requirements': ['build', 'run', 'conflicts'],
     'app': ['entry', 'icon', 'summary', 'type', 'cli_opts',
@@ -290,7 +329,7 @@ def check_bad_chrs(s, field):
             sys.exit("Error: bad character '%s' in %s: %s" % (c, field, s))
 
 
-def handle_config_version(ms, ver):
+def handle_config_version(ms, ver, dep_type='run'):
     """
     'ms' is an instance of MatchSpec, and 'ver' is the version from the
     configuration, e.g. for ms.name == 'python', ver = 26 or None,
@@ -307,7 +346,13 @@ def handle_config_version(ms, ver):
         else:  # regular version
             return ms
 
-    if ver is None or (ms.strictness == 1 and ms.name == 'numpy'):
+    # If we don't have a configured version, or we are dealing with a simple
+    # numpy runtime dependency; just use "numpy"/the name of the package as
+    # the specification. In practice this means that a recipe which just
+    # defines numpy as a runtime dependency will match any version of numpy
+    # at install time.
+    if ver is None or (dep_type == 'run' and ms.strictness == 1 and
+                       ms.name == 'numpy'):
         return MatchSpec(ms.name)
 
     ver = text_type(ver)
@@ -319,39 +364,84 @@ def handle_config_version(ms, ver):
     return MatchSpec('%s %s*' % (ms.name, ver))
 
 
-class MetaData(object):
+def find_recipe(path):
+    """recurse through a folder, locating meta.yaml.  Raises error if more than one is found.
 
-    def __init__(self, path):
-        assert isdir(path)
-        self.path = path
-        self.meta_path = join(path, 'meta.yaml')
-        self.requirements_path = join(path, 'requirements.txt')
-        if not isfile(self.meta_path):
-            self.meta_path = join(path, 'conda.yaml')
-            if not isfile(self.meta_path):
-                sys.exit("Error: meta.yaml or conda.yaml not found in %s" % path)
+    Returns folder containing meta.yaml, to be built.
+
+    If we have a base level meta.yaml and other supplemental ones, use that first"""
+    results = rec_glob(path, ["meta.yaml", "conda.yaml"])
+    if len(results) > 1:
+        base_recipe = os.path.join(path, "meta.yaml")
+        if base_recipe in results:
+            return base_recipe
+        else:
+            raise IOError("More than one meta.yaml files found in %s" % path)
+    elif not results:
+        raise IOError("No meta.yaml or conda.yaml files found in %s" % path)
+    return results[0]
+
+
+class MetaData(object):
+    def __init__(self, path, config=None):
+
+        self.undefined_jinja_vars = []
+
+        if not config:
+            config = Config()
+
+        self.config = config
+
+        if isfile(path):
+            self.meta_path = path
+            self.path = os.path.dirname(path)
+        else:
+            self.meta_path = find_recipe(path)
+            self.path = os.path.dirname(self.meta_path)
+        self.requirements_path = join(self.path, 'requirements.txt')
 
         # Start with bare-minimum contents so we can call environ.get_dict() with impunity
         # We'll immediately replace these contents in parse_again()
         self.meta = parse("package:\n"
-                          "  name: uninitialized", path=self.meta_path)
+                          "  name: uninitialized",
+                          path=self.meta_path,
+                          config=self.config)
 
         # This is the 'first pass' parse of meta.yaml, so not all variables are defined yet
         # (e.g. GIT_FULL_HASH, etc. are undefined)
         # Therefore, undefined jinja variables are permitted here
         # In the second pass, we'll be more strict. See build.build()
-        self.parse_again(permit_undefined_jinja=True)
+        self.parse_again(config=config, permit_undefined_jinja=True)
+        self.config.disable_pip = self.disable_pip
 
-    def parse_again(self, permit_undefined_jinja=False):
+    @property
+    def disable_pip(self):
+        return 'build' in self.meta and 'disable_pip' in self.meta['build']
+
+    def parse_again(self, config=None, permit_undefined_jinja=False):
         """Redo parsing for key-value pairs that are not initialized in the
         first pass.
+
+        config: a conda-build Config object.  If None, the config object passed at creation
+                time is used.
 
         permit_undefined_jinja: If True, *any* use of undefined jinja variables will
                                 evaluate to an emtpy string, without emitting an error.
         """
         if not self.meta_path:
             return
-        self.meta = parse(self._get_contents(permit_undefined_jinja), path=self.meta_path)
+
+        if not config:
+            config = self.config
+
+        try:
+            os.environ["CONDA_BUILD_STATE"] = "RENDER"
+            self.meta = parse(self._get_contents(permit_undefined_jinja, config=config),
+                              config=config, path=self.meta_path)
+        except:
+            raise
+        finally:
+            del os.environ["CONDA_BUILD_STATE"]
 
         if (isfile(self.requirements_path) and
                    not self.meta['requirements']['run']):
@@ -359,8 +449,34 @@ class MetaData(object):
             run_requirements = specs_from_url(self.requirements_path)
             self.meta['requirements']['run'] = run_requirements
 
+    def parse_until_resolved(self, config):
+        # undefined_jinja_vars is refreshed by self.parse again
+        undefined_jinja_vars = ()
+        # always parse again at least once.
+        self.parse_again(config, permit_undefined_jinja=True)
+
+        while set(undefined_jinja_vars) != set(self.undefined_jinja_vars):
+            undefined_jinja_vars = self.undefined_jinja_vars
+            self.parse_again(config, permit_undefined_jinja=True)
+        if undefined_jinja_vars:
+            sys.exit("Undefined Jinja2 variables remain ({}).  Please enable "
+                     "source downloading and try again.".format(self.undefined_jinja_vars))
+
+        # always parse again at the end, too.
+        self.parse_again(config, permit_undefined_jinja=True)
+
     @classmethod
-    def fromdict(cls, metadata):
+    def fromstring(cls, metadata, config=None):
+        m = super(MetaData, cls).__new__(cls)
+        if not config:
+            config = Config()
+        m.meta = parse(metadata, path='', config=config)
+        m.config = config
+        m.parse_again(config=config, permit_undefined_jinja=True)
+        return m
+
+    @classmethod
+    def fromdict(cls, metadata, config=None):
         """
         Create a MetaData object from metadata dict directly.
         """
@@ -368,6 +484,13 @@ class MetaData(object):
         m.path = ''
         m.meta_path = ''
         m.meta = sanitize(metadata)
+
+        if not config:
+            config = Config()
+
+        m.config = config
+        m.undefined_jinja_vars = []
+
         return m
 
     def get_section(self, section):
@@ -401,14 +524,16 @@ class MetaData(object):
 
     def check_fields(self):
         for section, submeta in iteritems(self.meta):
+            # anything goes in the extra section
             if section == 'extra':
                 continue
             if section not in FIELDS:
-                sys.exit("Error: unknown section: %s" % section)
+                raise ValueError("unknown section: %s" % section)
             for key in submeta:
                 if key not in FIELDS[section]:
-                    sys.exit("Error: in section %r: unknown key %r" %
+                    raise ValueError("in section %r: unknown key %r" %
                              (section, key))
+        return True
 
     def name(self):
         res = self.get_value('package/name')
@@ -421,38 +546,47 @@ class MetaData(object):
         return res
 
     def version(self):
-        res = self.get_value('package/version')
+        res = str(self.get_value('package/version'))
         if res is None:
             sys.exit("Error: package/version missing in: %r" % self.meta_path)
         check_bad_chrs(res, 'package/version')
         return res
 
     def build_number(self):
-        return int(self.get_value('build/number', 0))
+        number = self.get_value('build/number')
+        # build number can come back as None if no setting (or jinja intermediate)
+        try:
+            build_int = int(number)
+        except (ValueError, TypeError):
+            build_int = ""
+        return build_int
 
     def ms_depends(self, typ='run'):
         res = []
         name_ver_list = [
-            ('python', config.CONDA_PY),
-            ('numpy', config.CONDA_NPY),
-            ('perl', config.CONDA_PERL),
-            ('lua', config.CONDA_LUA),
+            ('python', self.config.CONDA_PY),
+            ('numpy', self.config.CONDA_NPY),
+            ('perl', self.config.CONDA_PERL),
+            ('lua', self.config.CONDA_LUA),
             # r is kept for legacy installations, r-base deprecates it.
-            ('r', config.CONDA_R),
-            ('r-base', config.CONDA_R),
+            ('r', self.config.CONDA_R),
+            ('r-base', self.config.CONDA_R),
         ]
         for spec in self.get_value('requirements/' + typ, []):
             try:
                 ms = MatchSpec(spec)
             except AssertionError:
                 raise RuntimeError("Invalid package specification: %r" % spec)
+            except AttributeError:
+                raise RuntimeError("Received dictionary as spec.  Note that pip requirements are "
+                                   "not supported in conda-build meta.yaml.")
             if ms.name == self.name():
                 raise RuntimeError("%s cannot depend on itself" % self.name())
             for name, ver in name_ver_list:
                 if ms.name == name:
-                    if self.get_value('build/noarch_python'):
+                    if self.get_value('build/noarch_python') or self.get_value('build/noarch'):
                         continue
-                    ms = handle_config_version(ms, ver)
+                    ms = handle_config_version(ms, ver, typ)
 
             for c in '=!@#$%^&*:;"\'\\|<>?/':
                 if c in ms.name:
@@ -503,7 +637,7 @@ class MetaData(object):
             res.append('_')
         if features:
             res.extend(('_'.join(features), '_'))
-        res.append('%d' % self.build_number())
+        res.append('{0}'.format(self.build_number() if self.build_number() else 0))
         return ''.join(res)
 
     def dist(self):
@@ -536,10 +670,10 @@ class MetaData(object):
             name=self.name(),
             version=self.version(),
             build=self.build_id(),
-            build_number=self.build_number(),
-            platform=cc.platform,
-            arch=cc.arch_name,
-            subdir=cc.subdir,
+            build_number=self.build_number() if self.build_number() else 0,
+            platform=platform,
+            arch=arch_name,
+            subdir=self.config.subdir,
             depends=sorted(' '.join(ms.spec.split())
                              for ms in self.ms_depends()),
         )
@@ -548,13 +682,16 @@ class MetaData(object):
             if value:
                 d[key] = value
 
+        build_noarch = self.get_value('build/noarch')
         if self.get_value('build/features'):
             d['features'] = ' '.join(self.get_value('build/features'))
         if self.get_value('build/track_features'):
             d['track_features'] = ' '.join(self.get_value('build/track_features'))
-        if self.get_value('build/noarch_python'):
+        if self.get_value('build/noarch_python') or build_noarch:
             d['platform'] = d['arch'] = None
             d['subdir'] = 'noarch'
+            if build_noarch:
+                d['noarch'] = build_noarch
         if self.is_app():
             d.update(self.app_meta())
         return d
@@ -569,8 +706,27 @@ class MetaData(object):
                                    "as the path delimiter on Windows")
         return ret
 
+    def ignore_prefix_files(self):
+        ret = self.get_value('build/ignore_prefix_files', False)
+        if type(ret) not in (list, bool):
+            raise RuntimeError('build/ignore_prefix_files should be boolean or a list of paths')
+        if sys.platform == 'win32':
+            if type(ret) is list and any('\\' in i for i in ret):
+                raise RuntimeError("build/ignore_prefix_files paths must use / "
+                                   "as the path delimiter on Windows")
+        return ret
+
     def always_include_files(self):
-        return self.get_value('build/always_include_files', [])
+        files = self.get_value('build/always_include_files', [])
+        if any('\\' in i for i in files):
+            raise RuntimeError("build/always_include_files paths must use / "
+                                "as the path delimiter on Windows")
+        if on_win:
+            files = [f.replace("/", "\\") for f in files]
+        return files
+
+    def include_recipe(self):
+        return self.get_value('build/include_recipe', True)
 
     def binary_has_prefix_files(self):
         ret = self.get_value('build/binary_has_prefix_files', [])
@@ -585,7 +741,7 @@ class MetaData(object):
     def skip(self):
         return self.get_value('build/skip', False)
 
-    def _get_contents(self, permit_undefined_jinja):
+    def _get_contents(self, permit_undefined_jinja, config):
         '''
         Get the contents of our [meta.yaml|conda.yaml] file.
         If jinja is installed, then the template.render function is called
@@ -602,7 +758,7 @@ class MetaData(object):
             with open(self.meta_path) as fd:
                 return fd.read()
 
-        from conda_build.jinja_context import context_processor
+        from conda_build.jinja_context import context_processor, UndefinedNeverFail, FilteredLoader
 
         path, filename = os.path.split(self.meta_path)
         loaders = [  # search relative to '<conda_root>/Lib/site-packages/conda_build/templates'
@@ -619,67 +775,35 @@ class MetaData(object):
             env_loader = jinja2.FileSystemLoader(conda_env_path)
             loaders.append(jinja2.PrefixLoader({'$CONDA_DEFAULT_ENV': env_loader}))
 
-        class FilteredLoader(jinja2.BaseLoader):
-            """
-            A pass-through for the given loader, except that the loaded source is
-            filtered according to any metadata selectors in the source text.
-            """
-
-            def __init__(self, unfiltered_loader):
-                self._unfiltered_loader = unfiltered_loader
-                self.list_templates = unfiltered_loader.list_templates
-
-            def get_source(self, environment, template):
-                contents, filename, uptodate = self._unfiltered_loader.get_source(environment,
-                                                                                  template)
-                return select_lines(contents, ns_cfg()), filename, uptodate
-
         undefined_type = jinja2.StrictUndefined
         if permit_undefined_jinja:
-            class UndefinedNeverFail(jinja2.Undefined):
-                """
-                A class for Undefined jinja variables.
-                This is even less strict than the default jinja2.Undefined class,
-                because it permits things like {{ MY_UNDEFINED_VAR[:2] }} and
-                {{ MY_UNDEFINED_VAR|int }}. This can mask lots of errors in jinja templates, so it
-                should only be used for a first-pass parse, when you plan on running a 'strict'
-                second pass later.
-                """
-                __add__ = __radd__ = __mul__ = __rmul__ = __div__ = __rdiv__ = \
-                __truediv__ = __rtruediv__ = __floordiv__ = __rfloordiv__ = \
-                __mod__ = __rmod__ = __pos__ = __neg__ = __call__ = \
-                __getitem__ = __lt__ = __le__ = __gt__ = __ge__ = \
-                __complex__ = __pow__ = __rpow__ = \
-                    lambda *args, **kwargs: UndefinedNeverFail()
-
-                __str__ = __repr__ = \
-                    lambda *args, **kwargs: u''
-
-                __int__ = lambda _: 0
-                __float__ = lambda _: 0.0
-
-                def __getattr__(self, k):
-                    try:
-                        return object.__getattr__(self, k)
-                    except AttributeError:
-                        return UndefinedNeverFail()
-
-                def __setattr__(self, k, v):
-                    pass
-
+            # The UndefinedNeverFail class keeps a global list of all undefined names
+            # Clear any leftover names from the last parse.
+            UndefinedNeverFail.all_undefined_names = []
             undefined_type = UndefinedNeverFail
 
-        loader = FilteredLoader(jinja2.ChoiceLoader(loaders))
+        loader = FilteredLoader(jinja2.ChoiceLoader(loaders), config=config)
         env = jinja2.Environment(loader=loader, undefined=undefined_type)
-        env.globals.update(ns_cfg())
-        env.globals.update(context_processor(self, path))
+
+        env.globals.update(ns_cfg(config))
+        env.globals.update(context_processor(self, path, config=config,
+                                             permit_undefined_jinja=permit_undefined_jinja))
 
         try:
             template = env.get_or_select_template(filename)
-            return template.render(environment=env)
+            rendered = template.render(environment=env)
+
+            if permit_undefined_jinja:
+                self.undefined_jinja_vars = UndefinedNeverFail.all_undefined_names
+            else:
+                self.undefined_jinja_vars = []
+            return rendered
+
         except jinja2.TemplateError as ex:
+            if "'None' has not attribute" in str(ex):
+                ex = "Failed to run jinja context function"
             sys.exit("Error: Failed to render jinja template in {}:\n{}"
-                     .format(self.meta_path, ex.message))
+                     .format(self.meta_path, str(ex)))
 
     def __unicode__(self):
         '''
@@ -699,10 +823,50 @@ class MetaData(object):
         '''
         return self.__str__()
 
+    @property
+    def uses_vcs_in_meta(self):
+        """returns name of vcs used if recipe contains metadata associated with version control systems.
+        If this metadata is present, a download/copy will be forced in parse_or_try_download.
+        """
+        vcs_types = ["git", "svn", "hg"]
+        # We would get here if we use Jinja2 templating, but specify source with path.
+        with open(self.meta_path) as f:
+            metayaml = f.read()
+            for vcs in vcs_types:
+                matches = re.findall(r"{}_[^\.\s\'\"]+".format(vcs.upper()), metayaml)
+                if len(matches) > 0:
+                    if vcs == "hg":
+                        vcs = "mercurial"
+                    return vcs
+        return None
 
-if __name__ == '__main__':
-    from pprint import pprint
-    from os.path import expanduser
+    @property
+    def uses_setup_py_in_meta(self):
+        with open(self.meta_path) as f:
+            meta_text = f.read()
+        return "load_setup_py_data" in meta_text or "load_setuptools" in meta_text
 
-    m = MetaData(expanduser('~/conda-recipes/pycosat'))
-    pprint(m.info_index())
+    @property
+    def uses_jinja(self):
+        if not self.meta_path:
+            return False
+        with open(self.meta_path) as f:
+            metayaml = f.read()
+            matches = re.findall(r"{{.*}}", metayaml)
+        return len(matches) > 0
+
+    @property
+    def uses_vcs_in_build(self):
+        build_script = "bld.bat" if on_win else "build.sh"
+        build_script = os.path.join(os.path.dirname(self.meta_path), build_script)
+        if os.path.isfile(build_script):
+            vcs_types = ["git", "svn", "hg"]
+            with open(self.meta_path) as f:
+                build_script = f.read()
+                for vcs in vcs_types:
+                    matches = re.findall(r"{}(?:\.exe)?".format(vcs), build_script)
+                    if len(matches) > 0:
+                        if vcs == "hg":
+                            vcs = "mercurial"
+                        return vcs
+        return None
