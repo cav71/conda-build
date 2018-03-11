@@ -2,13 +2,12 @@ import os
 import shutil
 import sys
 
-from conda_build.conda_interface import TemporaryDirectory, PY3
 import pytest
 
-from conda_build import post
-from conda_build.utils import on_win
+from conda_build import post, api
+from conda_build.utils import on_win, package_has_file
 
-from .utils import test_config, testing_workdir, add_mangling
+from .utils import add_mangling, metadata_dir
 
 
 def test_compile_missing_pyc(testing_workdir):
@@ -38,3 +37,28 @@ def test_hardlinks_to_copies(testing_workdir):
 
     assert os.lstat('test1').st_nlink == 1
     assert os.lstat('test2').st_nlink == 1
+
+
+def test_postbuild_files_raise(testing_metadata, testing_workdir):
+    fn = 'buildstr', 'buildnum', 'version'
+    for f in fn:
+        with open(os.path.join(testing_metadata.config.work_dir,
+                               '__conda_{}__.txt'.format(f)), 'w') as fh:
+            fh.write('123')
+        with pytest.raises(ValueError) as exc:
+            post.get_build_metadata(testing_metadata)
+        assert f in str(exc)
+
+
+def test_postlink_script_in_output_explicit(testing_config):
+    recipe = os.path.join(metadata_dir, '_post_link_in_output')
+    pkg = api.build(recipe, config=testing_config, notest=True)[0]
+    assert (package_has_file(pkg, 'bin/.out1-post-link.sh') or
+            package_has_file(pkg, 'Scripts/.out1-post-link.bat'))
+
+
+def test_postlink_script_in_output_implicit(testing_config):
+    recipe = os.path.join(metadata_dir, '_post_link_in_output_implicit')
+    pkg = api.build(recipe, config=testing_config, notest=True)[0]
+    assert (package_has_file(pkg, 'bin/.out1-post-link.sh') or
+            package_has_file(pkg, 'Scripts/.out1-post-link.bat'))

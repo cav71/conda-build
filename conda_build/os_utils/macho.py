@@ -1,8 +1,10 @@
 from __future__ import absolute_import, division, print_function
 
+import re
 import sys
-from subprocess import Popen, check_output, PIPE
+from subprocess import Popen, check_output, PIPE, STDOUT, CalledProcessError
 from os.path import islink, isfile
+from conda_build.os_utils.pyldd import inspect_rpaths
 from itertools import islice
 
 NO_EXT = (
@@ -46,8 +48,14 @@ def is_dylib(path):
 
 
 def human_filetype(path):
-    lines = check_output(['otool', '-h', path]).decode('utf-8').splitlines()
-    assert lines[0].startswith(path), path
+    output = check_output(['otool', '-h', path]).decode('utf-8')
+    lines = output.splitlines()
+    if not lines[0].startswith((path, 'Mach header')):
+        raise ValueError(
+            'Expected `otool -h` output to start with'
+            ' Mach header or {0}, got:\n{1}'.format(path, output)
+        )
+    assert lines[0].startswith((path, 'Mach header')), path
 
     for line in lines:
         if line.strip().startswith('0x'):
@@ -151,7 +159,11 @@ def otool(path, cb_filter=is_dylib_info):
     Any key values that can be converted to integers are converted
     to integers, the rest are strings.
     """
-    lines = check_output(['otool', '-l', path]).decode('utf-8').splitlines()
+    lines = check_output(['otool', '-l', path], stderr=STDOUT).decode('utf-8')
+    # llvm-objdump returns 0 for some things that are anything but successful completion.
+    if (re.match('.*(is not a Mach-O|invalid|expected|unexpected).*', lines, re.MULTILINE)):
+        raise CalledProcessError
+    lines = lines.splitlines()
     return _get_matching_load_commands(lines, cb_filter)
 
 
@@ -172,8 +184,12 @@ def get_id(path):
 
 def get_rpaths(path):
     """Return a list of the dylib rpaths"""
-    rpaths = otool(path, is_rpath)
-    return [rpath['path'] for rpath in rpaths]
+    # rpaths = otool(path, is_rpath)
+    # res_otool = [rpath['path'] for rpath in rpaths]
+    res_pyldd = inspect_rpaths(path, resolve_dirnames=False, use_os_varnames=True)
+    # if set(res_otool) != set(res_pyldd):
+    #     print("disagreement about get_rpaths {} vs {}".format(set(res_otool), set(res_pyldd)))
+    return res_pyldd
 
 
 def add_rpath(path, rpath, verbose=False):
@@ -218,7 +234,7 @@ def delete_rpath(path, rpath, verbose=False):
         % p.returncode)
 
 
-def install_name_change(path, cb_func, verbose=False):
+def install_name_change(path, cb_func, dylibs, verbose=False):
     """Change dynamic shared library load name or id name of Mach-O Binary `path`.
 
     `cb_func` is called for each shared library load command. The dictionary of
@@ -228,7 +244,7 @@ def install_name_change(path, cb_func, verbose=False):
     When dealing with id load commands, `install_name_tool -id` is used.
     When dealing with dylib load commands `install_name_tool -change` is used.
     """
-    dylibs = otool(path)
+
     changes = []
     for index, dylib in enumerate(dylibs):
         new_name = cb_func(path, dylib)

@@ -1,15 +1,14 @@
 from __future__ import absolute_import, division, print_function
 
 from collections import defaultdict
+import fnmatch
 from functools import partial
-from glob import glob
+import glob2
+from glob2 import glob
 import io
 import locale
-import mmap
 import re
 import os
-from os.path import (basename, dirname, join, splitext, isdir, isfile, exists,
-                     islink, realpath, relpath, normpath)
 import stat
 from subprocess import call, check_output
 import sys
@@ -19,31 +18,31 @@ except ImportError:
     readlink = False
 
 from conda_build.os_utils import external
-from .conda_interface import lchmod
-from .conda_interface import walk_prefix
-from .conda_interface import md5_file
-from .conda_interface import PY3
+from conda_build.conda_interface import lchmod
+from conda_build.conda_interface import walk_prefix
+from conda_build.conda_interface import md5_file
+from conda_build.conda_interface import PY3
+from conda_build.conda_interface import TemporaryDirectory
 
-from conda_build import environ
 from conda_build import utils
-from conda_build import source
+from conda_build.os_utils.pyldd import is_codefile, inspect_linkages
+from conda_build.inspect_pkg import which_package
 
-if sys.platform.startswith('linux'):
-    from conda_build.os_utils import elf
-elif sys.platform == 'darwin':
+if sys.platform == 'darwin':
     from conda_build.os_utils import macho
 
-SHEBANG_PAT = re.compile(br'^#!.+$', re.M)
+if PY3:
+    scandir = os.scandir
+else:
+    from scandir import scandir
 
 
 def is_obj(path):
-    assert sys.platform != 'win32'
-    return bool((sys.platform.startswith('linux') and elf.is_elf(path)) or
-                (sys.platform == 'darwin' and macho.is_macho(path)))
+    return is_codefile(path)
 
 
 def fix_shebang(f, prefix, build_python, osx_is_app=False):
-    path = join(prefix, f)
+    path = os.path.join(prefix, f)
     if is_obj(path):
         return
     elif os.path.islink(path):
@@ -54,40 +53,59 @@ def fix_shebang(f, prefix, build_python, osx_is_app=False):
     if os.stat(path).st_size == 0:
         return
 
+    bytes_ = False
+
     with io.open(path, encoding=locale.getpreferredencoding(), mode='r+') as fi:
         try:
             data = fi.read(100)
+            fi.seek(0)
         except UnicodeDecodeError:  # file is binary
             return
 
+        SHEBANG_PAT = re.compile(r'^#!.+$', re.M)
+
         # regexp on the memory mapped file so we only read it into
         # memory if the regexp matches.
-        mm = mmap.mmap(fi.fileno(), 0)
-        m = SHEBANG_PAT.match(mm)
+        try:
+            mm = utils.mmap_mmap(fi.fileno(), 0, tagname=None, flags=utils.mmap_MAP_PRIVATE)
+        except OSError:
+            mm = fi.read()
+        try:
+            m = SHEBANG_PAT.match(mm)
+        except TypeError:
+            SHEBANG_PAT = re.compile(br'^#!.+$', re.M)
+            bytes_ = True
+            m = SHEBANG_PAT.match(mm)
 
-        if not (m and b'python' in m.group()):
+        python_str = b'python' if bytes_ else 'python'
+
+        if not (m and python_str in m.group()):
             return
 
         data = mm[:]
 
-    encoding = sys.stdout.encoding or 'utf8'
-
-    py_exec = ('/bin/bash ' + prefix + '/bin/python.app'
+    py_exec = '#!' + ('/bin/bash ' + prefix + '/bin/pythonw'
                if sys.platform == 'darwin' and osx_is_app else
-               prefix + '/bin/' + basename(build_python))
-    new_data = SHEBANG_PAT.sub(b'#!' + py_exec.encode(encoding), data, count=1)
+               prefix + '/bin/' + os.path.basename(build_python))
+    if bytes_ and hasattr(py_exec, 'encode'):
+        py_exec = py_exec.encode()
+    new_data = SHEBANG_PAT.sub(py_exec, data, count=1)
     if new_data == data:
         return
     print("updating shebang:", f)
     with io.open(path, 'w', encoding=locale.getpreferredencoding()) as fo:
-        fo.write(new_data.decode(encoding))
-    os.chmod(path, int('755', 8))
+        try:
+            fo.write(new_data)
+        except TypeError:
+            fo.write(new_data.decode())
+    os.chmod(path, 0o775)
 
 
 def write_pth(egg_path, config):
-    fn = basename(egg_path)
-    with open(join(environ.get_sp_dir(config),
-                   '%s.pth' % (fn.split('-')[0])), 'w') as fo:
+    fn = os.path.basename(egg_path)
+    py_ver = '.'.join(config.variant['python'].split('.')[:2])
+    with open(os.path.join(utils.get_site_packages(config.host_prefix, py_ver),
+                           '%s.pth' % (fn.split('-')[0])), 'w') as fo:
         fo.write('./%s\n' % fn)
 
 
@@ -96,53 +114,66 @@ def remove_easy_install_pth(files, prefix, config, preserve_egg_dir=False):
     remove the need for easy-install.pth and finally remove easy-install.pth
     itself
     """
-    absfiles = [join(prefix, f) for f in files]
-    sp_dir = environ.get_sp_dir(config)
-    for egg_path in glob(join(sp_dir, '*-py*.egg')):
-        if isdir(egg_path):
-            if preserve_egg_dir or not any(join(egg_path, i) in absfiles for i
+    absfiles = [os.path.join(prefix, f) for f in files]
+    py_ver = '.'.join(config.variant['python'].split('.')[:2])
+    sp_dir = utils.get_site_packages(prefix, py_ver)
+    for egg_path in glob(os.path.join(sp_dir, '*-py*.egg')):
+        if os.path.isdir(egg_path):
+            if preserve_egg_dir or not any(os.path.join(egg_path, i) in absfiles for i
                     in walk_prefix(egg_path, False, windows_forward_slashes=False)):
                 write_pth(egg_path, config=config)
                 continue
 
             print('found egg dir:', egg_path)
             try:
-                os.rename(join(egg_path, 'EGG-INFO'),
+                os.rename(os.path.join(egg_path, 'EGG-INFO'),
                           egg_path + '-info')
             except OSError:
                 pass
-            utils.rm_rf(join(egg_path, 'EGG-INFO'))
+            utils.rm_rf(os.path.join(egg_path, 'EGG-INFO'))
             for fn in os.listdir(egg_path):
                 if fn == '__pycache__':
-                    utils.rm_rf(join(egg_path, fn))
+                    utils.rm_rf(os.path.join(egg_path, fn))
                 else:
                     # this might be a name-space package
                     # so the package directory already exists
                     # from another installed dependency
-                    if os.path.exists(join(sp_dir, fn)):
-                        utils.copy_into(join(egg_path, fn), join(sp_dir, fn), config.timeout)
-                        utils.rm_rf(join(egg_path, fn))
+                    if os.path.exists(os.path.join(sp_dir, fn)):
+                        try:
+                            utils.copy_into(os.path.join(egg_path, fn),
+                                            os.path.join(sp_dir, fn), config.timeout,
+                                            locking=config.locking)
+                            utils.rm_rf(os.path.join(egg_path, fn))
+                        except IOError as e:
+                            fn = os.path.basename(str(e).split()[-1])
+                            raise IOError("Tried to merge folder {egg_path} into {sp_dir}, but {fn}"
+                                          " exists in both locations.  Please either add "
+                                          "build/preserve_egg_dir: True to meta.yaml, or manually "
+                                          "remove the file during your install process to avoid "
+                                          "this conflict."
+                                          .format(egg_path=egg_path, sp_dir=sp_dir, fn=fn))
                     else:
-                        os.rename(join(egg_path, fn), join(sp_dir, fn))
+                        os.rename(os.path.join(egg_path, fn), os.path.join(sp_dir, fn))
 
-        elif isfile(egg_path):
+        elif os.path.isfile(egg_path):
             if egg_path not in absfiles:
                 continue
             print('found egg:', egg_path)
             write_pth(egg_path, config=config)
 
-    utils.rm_rf(join(sp_dir, 'easy-install.pth'))
+    utils.rm_rf(os.path.join(sp_dir, 'easy-install.pth'))
 
 
 def rm_py_along_so(prefix):
-    "remove .py (.pyc) files alongside .so or .pyd files"
-    for root, _, files in os.walk(prefix):
-        for fn in files:
-            if fn.endswith(('.so', '.pyd')):
-                name, _ = splitext(fn)
-                for ext in '.py', '.pyc', '.pyo':
-                    if name + ext in files:
-                        os.unlink(join(root, name + ext))
+    """remove .py (.pyc) files alongside .so or .pyd files"""
+
+    files = list(scandir(prefix))
+    for fn in files:
+        if fn.is_file() and fn.name.endswith(('.so', '.pyd')):
+            name, _ = os.path.splitext(fn.path)
+            for ext in '.py', '.pyc', '.pyo':
+                if name + ext in files:
+                    os.unlink(name + ext)
 
 
 def rm_pyo(files, prefix):
@@ -160,9 +191,23 @@ def rm_pyo(files, prefix):
             os.unlink(os.path.join(prefix, fn))
 
 
-def compile_missing_pyc(files, cwd, python_exe):
-    compile_files = []
+def rm_pyc(files, prefix):
+    re_pyc = re.compile(r'.*(?:\.pyc$)')
     for fn in files:
+        if re_pyc.match(fn):
+            os.unlink(os.path.join(prefix, fn))
+
+
+def compile_missing_pyc(files, cwd, python_exe, skip_compile_pyc=()):
+    if not os.path.isfile(python_exe):
+        return
+    compile_files = []
+    skip_compile_pyc_n = [os.path.normpath(skip) for skip in skip_compile_pyc]
+    skipped_files = set()
+    for skip in skip_compile_pyc_n:
+        skipped_files.update(set(fnmatch.filter(files, skip)))
+    unskipped_files = set(files) - skipped_files
+    for fn in unskipped_files:
         # omit files in Library/bin, Scripts, and the root prefix - they are not generally imported
         if sys.platform == 'win32':
             if any([fn.lower().startswith(start) for start in ['library/bin', 'library\\bin',
@@ -176,24 +221,31 @@ def compile_missing_pyc(files, cwd, python_exe):
                 os.path.dirname(fn) + cache_prefix + os.path.basename(fn) + 'c' not in files):
             compile_files.append(fn)
 
-    if compile_files and os.path.isfile(python_exe):
-        print('compiling .pyc files...')
-        for f in compile_files:
-            call([python_exe, '-Wi', '-m', 'py_compile', f], cwd=cwd)
+    if compile_files:
+        if not os.path.isfile(python_exe):
+            print('compiling .pyc files... failed as no python interpreter was found')
+        else:
+            print('compiling .pyc files...')
+            for f in compile_files:
+                call([python_exe, '-Wi', '-m', 'py_compile', f], cwd=cwd)
 
 
-def post_process(files, prefix, config, preserve_egg_dir=False):
+def post_process(files, prefix, config, preserve_egg_dir=False, noarch=False, skip_compile_pyc=()):
     rm_pyo(files, prefix)
-    compile_missing_pyc(files, cwd=prefix, python_exe=config.build_python)
+    if noarch:
+        rm_pyc(files, prefix)
+    else:
+        python_exe = (config.build_python if os.path.isfile(config.build_python) else
+                      config.host_python)
+        compile_missing_pyc(files, cwd=prefix, python_exe=python_exe,
+                            skip_compile_pyc=skip_compile_pyc)
     remove_easy_install_pth(files, prefix, config, preserve_egg_dir=preserve_egg_dir)
     rm_py_along_so(prefix)
 
 
-def find_lib(link, prefix, path=None):
-    from conda_build.build import prefix_files
-    files = prefix_files(prefix)
+def find_lib(link, prefix, files, path=None):
     if link.startswith(prefix):
-        link = normpath(link[len(prefix) + 1:])
+        link = os.path.normpath(link[len(prefix) + 1:])
         if link not in files:
             sys.exit("Error: Could not find %s" % link)
         return link
@@ -204,21 +256,21 @@ def find_lib(link, prefix, path=None):
         # change it.
         return
     if '/' not in link or link.startswith('@executable_path/'):
-        link = basename(link)
+        link = os.path.basename(link)
         file_names = defaultdict(list)
         for f in files:
-            file_names[basename(f)].append(f)
+            file_names[os.path.basename(f)].append(f)
         if link not in file_names:
             sys.exit("Error: Could not find %s" % link)
         if len(file_names[link]) > 1:
-            if path and basename(path) == link:
+            if path and os.path.basename(path) == link:
                 # The link is for the file itself, just use it
                 return path
             # Allow for the possibility of the same library appearing in
             # multiple places.
             md5s = set()
             for f in file_names[link]:
-                md5s.add(md5_file(join(prefix, f)))
+                md5s.add(md5_file(os.path.join(prefix, f)))
             if len(md5s) > 1:
                 sys.exit("Error: Found multiple instances of %s: %s" % (link, file_names[link]))
             else:
@@ -229,14 +281,26 @@ def find_lib(link, prefix, path=None):
     print("Don't know how to find %s, skipping" % link)
 
 
-def osx_ch_link(path, link_dict, prefix):
+def osx_ch_link(path, link_dict, host_prefix, build_prefix, files):
     link = link_dict['name']
     print("Fixing linking of %s in %s" % (link, path))
-    link_loc = find_lib(link, prefix, path)
+    if build_prefix != host_prefix and link.startswith(build_prefix):
+        link = link.replace(build_prefix, host_prefix)
+        print(".. seems to be linking to a compiler runtime, replacing build prefix with "
+              "host prefix and")
+        if not is_obj(link):
+            sys.exit("Error: Compiler runtime library in build prefix not found in host prefix %s"
+                     % link)
+        else:
+            print(".. fixing linking of %s in %s instead" % (link, path))
+
+    link_loc = find_lib(link, host_prefix, files, path)
+    print("New link location is %s" % (link_loc))
+
     if not link_loc:
         return
 
-    lib_to_link = relpath(dirname(link_loc), 'lib')
+    lib_to_link = os.path.relpath(os.path.dirname(link_loc), 'lib')
     # path_to_lib = utils.relative(path[len(prefix) + 1:])
 
     # e.g., if
@@ -256,7 +320,7 @@ def osx_ch_link(path, link_dict, prefix):
     # @loader_path/path_to_lib/lib_to_link/basename(link), like
     # @loader_path/../../things/libthings.dylib.
 
-    ret = '@rpath/%s/%s' % (lib_to_link, basename(link))
+    ret = '@rpath/%s/%s' % (lib_to_link, os.path.basename(link))
 
     # XXX: IF the above fails for whatever reason, the below can be used
     # TODO: This might contain redundant ..'s if link and path are both in
@@ -268,30 +332,23 @@ def osx_ch_link(path, link_dict, prefix):
     return ret
 
 
-def mk_relative_osx(path, prefix, build_prefix=None):
-    '''
-    if build_prefix is None, the_n this is a standard conda build. The path
-    and all dependencies are in the build_prefix.
-
-    if package is built in develop mode, build_prefix is specified. Object
-    specified by 'path' needs to relink runtime dependences to libs found in
-    build_prefix/lib/. Also, in develop mode, 'path' is not in 'build_prefix'
-    '''
-    if build_prefix is None:
-        assert path.startswith(prefix + '/')
-    else:
-        prefix = build_prefix
-
+def mk_relative_osx(path, host_prefix, build_prefix, files):
     assert sys.platform == 'darwin' and is_obj(path)
-    s = macho.install_name_change(path, partial(osx_ch_link, prefix=prefix))
 
     names = macho.otool(path)
+    s = macho.install_name_change(path,
+                                  partial(osx_ch_link,
+                                          host_prefix=host_prefix,
+                                          build_prefix=build_prefix,
+                                          files=files),
+                                  dylibs=names)
+
     if names:
         # Add an rpath to every executable to increase the chances of it
         # being found.
-        rpath = join('@loader_path',
-                     relpath(join(prefix, 'lib'),
-                             dirname(path)), '').replace('/./', '/')
+        rpath = os.path.join('@loader_path',
+                     os.path.relpath(os.path.join(host_prefix, 'lib'),
+                             os.path.dirname(path)), '').replace('/./', '/')
         macho.add_rpath(path, rpath, verbose=True)
 
         # 10.7 install_name_tool -delete_rpath causes broken dylibs, I will revisit this ASAP.
@@ -302,38 +359,43 @@ def mk_relative_osx(path, prefix, build_prefix=None):
     if s:
         # Skip for stub files, which have to use binary_has_prefix_files to be
         # made relocatable.
-        assert_relative_osx(path, prefix)
+        assert_relative_osx(path, host_prefix)
 
 
 def mk_relative_linux(f, prefix, rpaths=('lib',)):
     'Respects the original values and converts abs to $ORIGIN-relative'
 
-    elf = join(prefix, f)
-    origin = dirname(elf)
+    elf = os.path.join(prefix, f)
+    origin = os.path.dirname(elf)
 
     patchelf = external.find_executable('patchelf', prefix)
-    existing = check_output([patchelf, '--print-rpath', elf]).decode('utf-8').splitlines()[0]
+    try:
+        existing = check_output([patchelf, '--print-rpath', elf]).decode('utf-8').splitlines()[0]
+    except:
+        print('patchelf: --print-rpath failed for %s\n' % (elf))
+        return
     existing = existing.split(os.pathsep)
     new = []
     for old in existing:
-        if old.startswith('$ORIGIN/'):
+        if old.startswith('$ORIGIN'):
             new.append(old)
         elif old.startswith('/'):
             # Test if this absolute path is outside of prefix. That is fatal.
             relpath = os.path.relpath(old, prefix)
-            assert not relpath.startswith('..' + os.sep), \
-                'rpath {0} is outside prefix {1}'.format(old, prefix)
-            relpath = '$ORIGIN/' + os.path.relpath(old, origin)
-            if relpath not in new:
-                new.append(relpath)
+            if relpath.startswith('..' + os.sep):
+                print('Warning: rpath {0} is outside prefix {1} (removing it)'.format(old, prefix))
+            else:
+                relpath = '$ORIGIN/' + os.path.relpath(old, origin)
+                if relpath not in new:
+                    new.append(relpath)
     # Ensure that the asked-for paths are also in new.
     for rpath in rpaths:
         if not rpath.startswith('/'):
             # IMHO utils.relative shouldn't exist, but I am too paranoid to remove
             # it, so instead, make sure that what I think it should be replaced by
             # gives the same result and assert if not. Yeah, I am a chicken.
-            rel_ours = utils.relative(f, rpath)
-            rel_stdlib = os.path.relpath(rpath, os.path.dirname(f))
+            rel_ours = os.path.normpath(utils.relative(f, rpath))
+            rel_stdlib = os.path.normpath(os.path.relpath(rpath, os.path.dirname(f)))
             assert rel_ours == rel_stdlib, \
                 'utils.relative {0} and relpath {1} disagree for {2}, {3}'.format(
                 rel_ours, rel_stdlib, f, rpath)
@@ -350,69 +412,243 @@ def assert_relative_osx(path, prefix):
         assert not name.startswith(prefix), path
 
 
-def mk_relative(m, f, prefix):
-    assert sys.platform != 'win32'
-    path = join(prefix, f)
+def print_msg(errors, text):
+    if text.startswith("  ERROR"):
+        errors.append(text)
+    print(text)
+
+
+def check_overlinking(m, files):
+    pkg_name = m.get_value('package/name')
+
+    errors = []
+
+    run_reqs = [req.split(' ')[0] for req in m.meta.get('requirements', {}).get('run', [])]
+    # sysroots and whitelists are similar, but the subtle distinctions are important.
+    sysroots = glob(os.path.join(m.config.build_prefix, '**', 'sysroot'))
+    whitelist = []
+    if 'target_platform' in m.config.variant and m.config.variant['target_platform'] == 'osx-64':
+        if not len(sysroots):
+            sysroots = ['/usr/lib', '/opt/X11', '/System/Library/Frameworks']
+        whitelist = ['/opt/X11/',
+                     '/usr/lib/libSystem.B.dylib',
+                     '/usr/lib/libcrypto.0.9.8.dylib',
+                     '/usr/lib/libobjc.A.dylib',
+                     '/System/Library/Frameworks/Accelerate.framework/*',
+                     '/System/Library/Frameworks/AGL.framework/*',
+                     '/System/Library/Frameworks/AppKit.framework/*',
+                     '/System/Library/Frameworks/ApplicationServices.framework/*',
+                     '/System/Library/Frameworks/AudioToolbox.framework/*',
+                     '/System/Library/Frameworks/AudioUnit.framework/*',
+                     '/System/Library/Frameworks/AVFoundation.framework/*',
+                     '/System/Library/Frameworks/CFNetwork.framework/*',
+                     '/System/Library/Frameworks/Carbon.framework/*',
+                     '/System/Library/Frameworks/Cocoa.framework/*',
+                     '/System/Library/Frameworks/CoreAudio.framework/*',
+                     '/System/Library/Frameworks/CoreFoundation.framework/*',
+                     '/System/Library/Frameworks/CoreGraphics.framework/*',
+                     '/System/Library/Frameworks/CoreMedia.framework/*',
+                     '/System/Library/Frameworks/CoreBluetooth.framework/*',
+                     '/System/Library/Frameworks/CoreMIDI.framework/*',
+                     '/System/Library/Frameworks/CoreMedia.framework/*',
+                     '/System/Library/Frameworks/CoreServices.framework/*',
+                     '/System/Library/Frameworks/CoreText.framework/*',
+                     '/System/Library/Frameworks/CoreVideo.framework/*',
+                     '/System/Library/Frameworks/CoreWLAN.framework/*',
+                     '/System/Library/Frameworks/DiskArbitration.framework/*',
+                     '/System/Library/Frameworks/Foundation.framework/*',
+                     '/System/Library/Frameworks/GameController.framework/*',
+                     '/System/Library/Frameworks/GLKit.framework/*',
+                     '/System/Library/Frameworks/ImageIO.framework/*',
+                     '/System/Library/Frameworks/IOBluetooth.framework/*',
+                     '/System/Library/Frameworks/IOKit.framework/*',
+                     '/System/Library/Frameworks/IOSurface.framework/*',
+                     '/System/Library/Frameworks/OpenAL.framework/*',
+                     '/System/Library/Frameworks/OpenGL.framework/*',
+                     '/System/Library/Frameworks/Quartz.framework/*',
+                     '/System/Library/Frameworks/QuartzCore.framework/*',
+                     '/System/Library/Frameworks/Security.framework/*',
+                     '/System/Library/Frameworks/StoreKit.framework/*',
+                     '/System/Library/Frameworks/SystemConfiguration.framework/*',
+                     '/System/Library/Frameworks/WebKit.framework/*']
+    whitelist += m.meta.get('build', {}).get('missing_dso_whitelist', [])
+    for f in files:
+        path = os.path.join(m.config.host_prefix, f)
+        if not is_obj(path):
+            continue
+        warn_prelude = "WARNING ({},{})".format(pkg_name, f)
+        err_prelude = "  ERROR ({},{})".format(pkg_name, f)
+        info_prelude = "   INFO ({},{})".format(pkg_name, f)
+        msg_prelude = err_prelude if m.config.error_overlinking else warn_prelude
+
+        needed = inspect_linkages(path, resolve_filenames=True, recurse=False)
+        for needed_dso in needed:
+            if needed_dso.startswith(m.config.host_prefix):
+                in_prefix_dso = os.path.normpath(needed_dso.replace(m.config.host_prefix + '/', ''))
+                n_dso_p = "Needed DSO {}".format(in_prefix_dso)
+                and_also = " (and also in this package)" if in_prefix_dso in files else ""
+                pkgs = list(which_package(in_prefix_dso, m.config.host_prefix))
+                in_pkgs_in_run_reqs = [pkg for pkg in pkgs if pkg.quad[0] in run_reqs]
+                in_whitelist = any([glob2.fnmatch.fnmatch(in_prefix_dso, w) for w in whitelist])
+                if in_whitelist:
+                    print_msg(errors, '{}: {} found in the whitelist'.
+                              format(info_prelude, n_dso_p))
+                elif len(in_pkgs_in_run_reqs) == 1 and m.config.verbose:
+                    print_msg(errors, '{}: {} found in {}{}'.format(info_prelude,
+                                                                    n_dso_p,
+                                                                    in_pkgs_in_run_reqs[0],
+                                                                    and_also))
+                elif len(in_pkgs_in_run_reqs) == 0 and len(pkgs) > 0:
+                    print_msg(errors, '{}: {} found in {}{}'.format(msg_prelude,
+                                                                    n_dso_p,
+                                                                    [p.quad[0] for p in pkgs],
+                                                                    and_also))
+                    print_msg(errors, '{}: .. but {} not in reqs/run, i.e. it is overlinked'
+                                      ' (likely) or a missing dependency (less likely)'.
+                                      format(msg_prelude, [p.quad[0] for p in pkgs]))
+                elif len(in_pkgs_in_run_reqs) > 1:
+                    print_msg(errors, '{}: {} found in multiple packages in run/reqs: {}{}'
+                                      .format(warn_prelude,
+                                              in_prefix_dso,
+                                              [p.quad[0] for p in in_pkgs_in_run_reqs],
+                                              and_also))
+                else:
+                    if in_prefix_dso not in files:
+                        print_msg(errors, '{}: {} not found in any packages'.format(msg_prelude,
+                                                                                    in_prefix_dso))
+                    elif m.config.verbose:
+                        print_msg(errors, '{}: {} found in this package'.format(info_prelude,
+                                                                                in_prefix_dso))
+            elif needed_dso.startswith(m.config.build_prefix):
+                print_msg(errors, "ERROR: {} found in build prefix; should never happen".format(
+                    needed_dso))
+            else:
+                # A system or ignored dependency. We should be able to find it in one of the CDT o
+                # compiler packages on linux or at in a sysroot folder on other OSes. These usually
+                # start with '$RPATH/' which indicates pyldd did not find them, so remove that now.
+                if needed_dso.startswith('$RPATH/'):
+                    needed_dso = needed_dso.replace('$RPATH/', '')
+                in_whitelist = any([glob2.fnmatch.fnmatch(needed_dso, w) for w in whitelist])
+                if in_whitelist:
+                    n_dso_p = "Needed DSO {}".format(needed_dso)
+                    print_msg(errors, '{}: {} found in the whitelist'.
+                              format(info_prelude, n_dso_p))
+                elif m.config.verbose and len(sysroots):
+                    # Check id we have a CDT package.
+                    dso_fname = os.path.basename(needed_dso)
+                    sysroot_files = []
+                    for sysroot in sysroots:
+                        sysroot_files.extend(glob(os.path.join(sysroot, '**', dso_fname)))
+                    if len(sysroot_files):
+                        # Removing config.build_prefix is only *really* for Linux, though we could
+                        # use CONDA_BUILD_SYSROOT for macOS. We should figure out what to do about
+                        # /opt/X11 too.
+                        # Find the longest suffix match.
+                        rev_needed_dso = needed_dso[::-1]
+                        match_lens = [len(os.path.commonprefix([s[::-1], rev_needed_dso]))
+                                      for s in sysroot_files]
+                        idx = max(range(len(match_lens)), key=match_lens.__getitem__)
+                        in_prefix_dso = os.path.normpath(sysroot_files[idx].replace(
+                            m.config.build_prefix + '/', ''))
+                        n_dso_p = "Needed DSO {}".format(in_prefix_dso)
+                        pkgs = list(which_package(in_prefix_dso, m.config.build_prefix))
+                        if len(pkgs):
+                            print_msg(errors, '{}: {} found in CDT/compiler package {}'.
+                                              format(info_prelude, n_dso_p, pkgs[0]))
+                        else:
+                            print_msg(errors, '{}: {} not found in any CDT/compiler package,'
+                                              ' nor the whitelist?!'.
+                                          format(msg_prelude, n_dso_p))
+                    else:
+                        print_msg(errors, "{}: {} not found in sysroot, is this binary repackaging?"
+                                          " .. do you need to use install_name_tool/patchelf?".
+                                          format(msg_prelude, needed_dso))
+                else:
+                    print_msg(errors, "{}: did not find - or even know where to look for: {}".
+                                      format(msg_prelude, needed_dso))
+    if len(errors):
+        sys.exit(1)
+
+
+def post_process_shared_lib(m, f, files):
+    path = os.path.join(m.config.host_prefix, f)
     if not is_obj(path):
         return
-
-    # skip over this file
-    if (m.ignore_prefix_files() and (type(m.ignore_prefix_files()) is bool or
-                                     f in m.ignore_prefix_files())):
-        print("Skipping relocation path patch for " + f)
-        return
-
     if sys.platform.startswith('linux'):
-        mk_relative_linux(f, prefix=prefix, rpaths=m.get_value('build/rpaths', ['lib']))
+        mk_relative_linux(f, m.config.host_prefix, rpaths=m.get_value('build/rpaths', ['lib']))
     elif sys.platform == 'darwin':
-        mk_relative_osx(path, prefix=prefix)
+        mk_relative_osx(path, m.config.host_prefix, m.config.build_prefix, files=files)
 
 
 def fix_permissions(files, prefix):
     print("Fixing permissions")
-    for root, dirs, _ in os.walk(prefix):
-        for dn in dirs:
-            lchmod(join(root, dn), int('755', 8))
+    for path in scandir(prefix):
+        if path.is_dir():
+            lchmod(path.path, 0o775)
 
     for f in files:
-        path = join(prefix, f)
+        path = os.path.join(prefix, f)
         st = os.lstat(path)
-        lchmod(path, stat.S_IMODE(st.st_mode) | stat.S_IWUSR)  # chmod u+w
+        old_mode = stat.S_IMODE(st.st_mode)
+        new_mode = old_mode
+        # broadcast execute
+        if old_mode & stat.S_IXUSR:
+            new_mode = new_mode | stat.S_IXGRP | stat.S_IXOTH
+        # ensure user and group can write and all can read
+        new_mode = new_mode | stat.S_IWUSR | stat.S_IWGRP | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH  # noqa
+        if old_mode != new_mode:
+            try:
+                lchmod(path, new_mode)
+            except (OSError, utils.PermissionError) as e:
+                log = utils.get_logger(__name__)
+                log.warn(str(e))
 
 
-def post_build(m, files, prefix, build_python, croot):
+def post_build(m, files, build_python):
     print('number of files:', len(files))
-    fix_permissions(files, prefix)
+
+    for f in files:
+        make_hardlink_copy(f, m.config.host_prefix)
 
     if sys.platform == 'win32':
         return
 
-    binary_relocation = bool(m.get_value('build/binary_relocation', True))
+    binary_relocation = m.binary_relocation()
     if not binary_relocation:
         print("Skipping binary relocation logic")
-    osx_is_app = bool(m.get_value('build/osx_is_app', False))
+    osx_is_app = bool(m.get_value('build/osx_is_app', False)) and sys.platform == 'darwin'
+
+    check_symlinks(files, m.config.host_prefix, m.config.croot)
+    prefix_files = utils.prefix_files(m.config.host_prefix)
 
     for f in files:
         if f.startswith('bin/'):
-            fix_shebang(f, prefix=prefix, build_python=build_python, osx_is_app=osx_is_app)
-        if binary_relocation:
-            mk_relative(m, f, prefix)
-        make_hardlink_copy(f, prefix)
-
-    check_symlinks(files, prefix, croot)
+            fix_shebang(f, prefix=m.config.host_prefix, build_python=build_python,
+                        osx_is_app=osx_is_app)
+        if binary_relocation is True or (isinstance(binary_relocation, list) and
+                                         f in binary_relocation):
+            post_process_shared_lib(m, f, prefix_files)
+    check_overlinking(m, files)
 
 
 def check_symlinks(files, prefix, croot):
     if readlink is False:
         return  # Not on Unix system
     msgs = []
-    real_build_prefix = realpath(prefix)
+    real_build_prefix = os.path.realpath(prefix)
     for f in files:
-        path = join(real_build_prefix, f)
-        if islink(path):
+        path = os.path.join(real_build_prefix, f)
+        if os.path.islink(path):
             link_path = readlink(path)
-            real_link_path = realpath(path)
-            if real_link_path.startswith(real_build_prefix):
+            real_link_path = os.path.realpath(path)
+            # symlinks to binaries outside of the same dir don't work.  RPATH stuff gets confused
+            #    because ld.so follows symlinks in RPATHS
+            #    If condition exists, then copy the file rather than symlink it.
+            if (not os.path.dirname(link_path) == os.path.dirname(real_link_path) and
+                    is_obj(f)):
+                os.remove(path)
+                utils.copy_into(real_link_path, path)
+            elif real_link_path.startswith(real_build_prefix):
                 # If the path is in the build prefix, this is fine, but
                 # the link needs to be relative
                 if not link_path.startswith('.'):
@@ -422,7 +658,7 @@ def check_symlinks(files, prefix, croot):
                     # such crazy things don't happen.
                     print("Making absolute symlink %s -> %s relative" % (f, link_path))
                     os.unlink(path)
-                    os.symlink(relpath(real_link_path, dirname(path)), path)
+                    os.symlink(os.path.relpath(real_link_path, os.path.dirname(path)), path)
             else:
                 # Symlinks to absolute paths on the system (like /usr) are fine.
                 if real_link_path.startswith(croot):
@@ -438,49 +674,32 @@ def check_symlinks(files, prefix, croot):
 def make_hardlink_copy(path, prefix):
     """Hardlinks create invalid packages.  Copy files to break the link.
     Symlinks are OK, and unaffected here."""
-    if not os.path.isabs(path) and not os.path.exists(path):
+    if not os.path.isabs(path):
         path = os.path.normpath(os.path.join(prefix, path))
-    nlinks = os.lstat(path).st_nlink
-    dest = 'tmpfile'
-    if os.path.isabs(path):
-        dest = os.path.join(os.getcwd(), dest)
-    if nlinks > 1:
-        # copy file to new name
-        utils.copy_into(path, dest)
-        # remove old file
-        utils.rm_rf(path)
-        # rename copy to original filename
-        utils.copy_into(dest, path)
-        utils.rm_rf(dest)
+    fn = os.path.basename(path)
+    if os.lstat(path).st_nlink > 1:
+        with TemporaryDirectory() as dest:
+            # copy file to new name
+            utils.copy_into(path, dest)
+            # remove old file
+            utils.rm_rf(path)
+            # rename copy to original filename
+            #   It is essential here to use copying (as opposed to os.rename), so that
+            #        crossing volume boundaries works
+            utils.copy_into(os.path.join(dest, fn), path)
 
 
-def get_build_metadata(m, config):
-    src_dir = config.work_dir
-
-    if "build" not in m.meta:
-        m.meta["build"] = {}
-    if exists(join(src_dir, '__conda_version__.txt')):
-        print("Deprecation warning: support for __conda_version__ will be removed in Conda build 3.0."  # noqa
+def get_build_metadata(m):
+    src_dir = m.config.work_dir
+    if os.path.exists(os.path.join(src_dir, '__conda_version__.txt')):
+        raise ValueError("support for __conda_version__ has been removed as of Conda-build 3.0."
               "Try Jinja templates instead: "
               "http://conda.pydata.org/docs/building/meta-yaml.html#templating-with-jinja")
-        with open(join(src_dir, '__conda_version__.txt')) as f:
-            version = f.read().strip()
-            print("Setting version from __conda_version__.txt: %s" % version)
-            m.meta['package']['version'] = version
-    if exists(join(src_dir, '__conda_buildnum__.txt')):
-        print("Deprecation warning: support for __conda_buildnum__ will be removed in Conda build 3.0."  # noqa
+    if os.path.exists(os.path.join(src_dir, '__conda_buildnum__.txt')):
+        raise ValueError("support for __conda_buildnum__ has been removed as of Conda-build 3.0."
               "Try Jinja templates instead: "
               "http://conda.pydata.org/docs/building/meta-yaml.html#templating-with-jinja")
-        with open(join(src_dir, '__conda_buildnum__.txt')) as f:
-            build_number = f.read().strip()
-            print("Setting build number from __conda_buildnum__.txt: %s" %
-                  build_number)
-            m.meta['build']['number'] = build_number
-    if exists(join(src_dir, '__conda_buildstr__.txt')):
-        print("Deprecation warning: support for __conda_buildstr__ will be removed in Conda build 3.0."  # noqa
+    if os.path.exists(os.path.join(src_dir, '__conda_buildstr__.txt')):
+        raise ValueError("support for __conda_buildstr__ has been removed as of Conda-build 3.0."
               "Try Jinja templates instead: "
               "http://conda.pydata.org/docs/building/meta-yaml.html#templating-with-jinja")
-        with open(join(src_dir, '__conda_buildstr__.txt')) as f:
-            buildstr = f.read().strip()
-            print("Setting version from __conda_buildstr__.txt: %s" % buildstr)
-            m.meta['build']['string'] = buildstr

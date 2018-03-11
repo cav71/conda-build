@@ -7,10 +7,6 @@ conda-build
 
 .. image:: https://ci.appveyor.com/api/projects/status/07r1m8fy55jee9th?svg=true
                :target: https://ci.appveyor.com/project/ContinuumAnalyticsFOSS/conda-build
-               
-.. image:: https://www.quantifiedcode.com/api/v1/project/1960a96404aa431bab5d834edff1cf85/badge.svg
-  :target: https://www.quantifiedcode.com/app/project/1960a96404aa431bab5d834edff1cf85
-  :alt: Code issues
   
 .. image:: https://codecov.io/gh/conda/conda-build/branch/master/graph/badge.svg
   :target: https://codecov.io/gh/conda/conda-build
@@ -95,8 +91,14 @@ Testing
 -------
 
 Running our test suite requires cloning one other repo at the same level as conda-build:
-https://github.com/conda/conda_build_test_repo - this is necessary for relative path tests
+https://github.com/conda/conda_build_test_recipe - this is necessary for relative path tests
 outside of conda build's build tree.
+
+Additionally, you need to install a few extra packages:
+
+.. code-block:: bash
+
+  conda install pytest pytest-cov mock
 
 The test suite runs with py.test. Some useful commands to run select tests,
 assuming you are in the conda-build root folder:

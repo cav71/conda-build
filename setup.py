@@ -9,15 +9,14 @@ if sys.version_info[:2] < (2, 7):
     sys.exit("conda-build is only meant for Python >=2.7"
              "Current Python version: %d.%d" % sys.version_info[:2])
 
-versioneer.VCS = 'git'
-versioneer.versionfile_source = 'conda_build/_version.py'
-versioneer.versionfile_build = 'conda_build/_version.py'
-versioneer.tag_prefix = ''
-versioneer.parentdir_prefix = 'conda-build-'
+# Don't proceed with 'unknown' in version
+version_dict = versioneer.get_versions()
+if version_dict['error']:
+    raise RuntimeError(version_dict["error"])
 
 setup(
     name="conda-build",
-    version=versioneer.get_version(),
+    version=version_dict['version'],
     cmdclass=versioneer.get_cmdclass(),
     author="Continuum Analytics, Inc.",
     author_email="conda@continuum.io",
@@ -45,10 +44,10 @@ setup(
                             'conda-inspect = conda_build.cli.main_inspect:main',
                             'conda-metapackage = conda_build.cli.main_metapackage:main',
                             'conda-render = conda_build.cli.main_render:main',
-                            'conda-sign = conda_build.cli.main_sign:main',
                             'conda-skeleton = conda_build.cli.main_skeleton:main',
                             ]},
-    install_requires=['conda', 'requests', 'filelock'],
+    install_requires=['conda', 'requests', 'filelock', 'pyyaml', 'conda-verify',
+                      'jinja2', 'pkginfo', 'glob2', 'beautifulsoup4'],
     package_data={'conda_build': ['templates/*', 'cli-*.exe']},
     zip_safe=False,
 )

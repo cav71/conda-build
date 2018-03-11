@@ -1,12 +1,11 @@
-import os
 import io
-import sys
 import json
-import shutil
 import locale
+import logging
+import os
 from os.path import basename, dirname, isdir, join, isfile
-
-from conda_build.post import SHEBANG_PAT
+import shutil
+import sys
 
 ISWIN = sys.platform.startswith('win')
 
@@ -22,7 +21,8 @@ def _error_exit(exit_message):
 
 def rewrite_script(fn, prefix):
     """Take a file from the bin directory and rewrite it into the python-scripts
-    directory after it passes some sanity checks for noarch pacakges"""
+    directory with the same permissions after it passes some sanity checks for
+    noarch pacakges"""
 
     # Load and check the source file for not being a binary
     src = join(prefix, 'Scripts' if ISWIN else 'bin', fn)
@@ -31,28 +31,20 @@ def rewrite_script(fn, prefix):
             data = fi.read()
         except UnicodeDecodeError:  # file is binary
             _error_exit("Noarch package contains binary script: %s" % fn)
+    src_mode = os.stat(src).st_mode
     os.unlink(src)
 
     # Get rid of '-script.py' suffix on Windows
     if ISWIN and fn.endswith('-script.py'):
         fn = fn[:-10]
 
-    # Check that it does have a #! python string, and skip it
-    encoding = sys.stdout.encoding or 'utf8'
-
-    m = SHEBANG_PAT.match(data.encode(encoding))
-    if m and b'python' in m.group():
-        new_data = data[data.find('\n') + 1:]
-    elif ISWIN:
-        new_data = data
-    else:
-        _error_exit("No python shebang in: %s" % fn)
-
     # Rewrite the file to the python-scripts directory
     dst_dir = join(prefix, 'python-scripts')
     _force_dir(dst_dir)
-    with open(join(dst_dir, fn), 'w') as fo:
-        fo.write(new_data)
+    dst = join(dst_dir, fn)
+    with open(dst, 'w') as fo:
+        fo.write(data)
+    os.chmod(dst, src_mode)
     return fn
 
 
@@ -67,7 +59,7 @@ def handle_file(f, d, prefix):
 
     # The presence of .so indicated this is not a noarch package
     elif f.endswith(('.so', '.dll', '.pyd', '.exe', '.dylib')):
-        if f.endswith('.exe') and (isfile(f[:-4] + '-script.py') or
+        if f.endswith('.exe') and (isfile(os.path.join(prefix, f[:-4] + '-script.py')) or
                                    basename(f[:-4]) in d['python-scripts']):
             os.unlink(path)  # this is an entry point with a matching xx-script.py
             return
@@ -93,36 +85,14 @@ def handle_file(f, d, prefix):
     # Include examples in the metadata doc
     elif f.startswith(('Examples/', 'Examples\\')):
         d['Examples'].append(f[9:])
+    # No special treatment for other files
+    # leave them as-is
     else:
-        _error_exit("Error: Don't know how to handle file: %s" % f)
+        log = logging.getLogger(__name__)
+        log.debug("Don't know how to handle file: %s.  Including it as-is." % f)
 
 
-def transform(m, files, prefix):
-    assert 'py_' in m.dist()
-
-    name = m.name()
-
-    bin_dir = join(prefix, 'bin')
-    _force_dir(bin_dir)
-
-    # Create *nix prelink script
-    # Note: it's important to use LF newlines or it wont work if we build on Win
-    with open(join(bin_dir, '.%s-pre-link.sh' % name), 'wb') as fo:
-        fo.write('''\
-#!/bin/bash
-$PREFIX/bin/python $SOURCE_DIR/link.py
-'''.encode('utf-8'))
-
-    scripts_dir = join(prefix, 'Scripts')
-    _force_dir(scripts_dir)
-
-    # Create windows prelink script (be nice and use Windows newlines)
-    with open(join(scripts_dir, '.%s-pre-link.bat' % name), 'wb') as fo:
-        fo.write('''\
-@echo off
-"%PREFIX%\\python.exe" "%SOURCE_DIR%\\link.py"
-'''.replace('\n', '\r\n').encode('utf-8'))
-
+def populate_files(m, files, prefix, entry_point_scripts=None):
     d = {'dist': m.dist(),
          'site-packages': [],
          'python-scripts': [],
@@ -137,6 +107,41 @@ $PREFIX/bin/python $SOURCE_DIR/link.py
         for fns in (d['site-packages'], d['Examples']):
             for i, fn in enumerate(fns):
                 fns[i] = fn.replace('\\', '/')
+
+    if entry_point_scripts:
+        for entry_point in entry_point_scripts:
+            src = join(prefix, entry_point)
+            if os.path.isfile(src):
+                os.unlink(src)
+
+    return d
+
+
+def transform(m, files, prefix):
+    bin_dir = join(prefix, 'bin')
+    _force_dir(bin_dir)
+
+    scripts_dir = join(prefix, 'Scripts')
+    _force_dir(scripts_dir)
+
+    name = m.name()
+
+    # Create *nix prelink script
+    # Note: it's important to use LF newlines or it wont work if we build on Win
+    with open(join(bin_dir, '.%s-pre-link.sh' % name), 'wb') as fo:
+        fo.write('''\
+    #!/bin/bash
+    $PREFIX/bin/python $SOURCE_DIR/link.py
+    '''.encode('utf-8'))
+
+    # Create windows prelink script (be nice and use Windows newlines)
+    with open(join(scripts_dir, '.%s-pre-link.bat' % name), 'wb') as fo:
+        fo.write('''\
+    @echo off
+    "%PREFIX%\\python.exe" "%SOURCE_DIR%\\link.py"
+    '''.replace('\n', '\r\n').encode('utf-8'))
+
+    d = populate_files(m, files, prefix)
 
     # Find our way to this directory
     this_dir = dirname(__file__)

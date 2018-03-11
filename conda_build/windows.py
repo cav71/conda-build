@@ -2,7 +2,7 @@ from __future__ import absolute_import, division, print_function
 
 import os
 import sys
-from os.path import isdir, join
+from os.path import isdir, join, dirname, isfile
 
 # importing setuptools patches distutils so that it knows how to find VC for python 2.7
 import setuptools  # noqa
@@ -11,11 +11,9 @@ import setuptools  # noqa
 from distutils.msvc9compiler import find_vcvarsall as distutils_find_vcvarsall
 from distutils.msvc9compiler import Reg, WINSDK_BASE
 
-from .conda_interface import bits
-
 from conda_build import environ
-from conda_build import source
-from conda_build.utils import _check_call, root_script_dir, path_prepended
+from conda_build.utils import check_call_env, root_script_dir, path_prepended, copy_into, get_logger
+from conda_build.variants import set_language_env_vars, get_default_variant
 
 
 assert sys.platform == 'win32'
@@ -29,6 +27,37 @@ VS_VERSION_STRING = {
     '12.0': 'Visual Studio 12 2013',
     '14.0': 'Visual Studio 14 2015'
 }
+
+
+def fix_staged_scripts(scripts_dir, config):
+    """
+    Fixes scripts which have been installed unix-style to have a .bat
+    helper
+    """
+    if not isdir(scripts_dir):
+        return
+    for fn in os.listdir(scripts_dir):
+        # process all the extensionless files
+        if not isfile(join(scripts_dir, fn)) or '.' in fn:
+            continue
+
+        # read as binary file to ensure we don't run into encoding errors, see #1632
+        with open(join(scripts_dir, fn), 'rb') as f:
+            line = f.readline()
+            # If it's a #!python script
+            if not (line.startswith(b'#!') and b'python' in line.lower()):
+                continue
+            print('Adjusting unix-style #! script %s, '
+                  'and adding a .bat file for it' % fn)
+            # copy it with a .py extension (skipping that first #! line)
+            with open(join(scripts_dir, fn + '-script.py'), 'wb') as fo:
+                fo.write(f.read())
+            # now create the .exe file
+            copy_into(join(dirname(__file__), 'cli-%s.exe' % config.host_arch),
+                            join(scripts_dir, fn + '.exe'))
+
+        # remove the original script
+        os.remove(join(scripts_dir, fn))
 
 
 def build_vcvarsall_vs_path(version):
@@ -56,7 +85,13 @@ def build_vcvarsall_vs_path(version):
 
 
 def msvc_env_cmd(bits, config, override=None):
-    arch_selector = 'x86' if bits == 32 else 'amd64'
+    log = get_logger(__name__)
+    log.warn("Using legacy MSVC compiler setup.  This will be removed in conda-build 4.0. "
+             "If this recipe does not use a compiler, this message is safe to ignore.  "
+             "Otherwise, use {{compiler('<language>')}} jinja2 in requirements/build.")
+    # this has been an int at times.  Make sure it's a string for consistency.
+    bits = str(bits)
+    arch_selector = 'x86' if bits == '32' else 'amd64'
 
     msvc_env_lines = []
 
@@ -75,10 +110,11 @@ def msvc_env_cmd(bits, config, override=None):
     msvc_env_lines.append('set MSSdk=1')
 
     if not version:
-        if config.PY3K and config.use_MSVC2015:
+        py_ver = config.variant.get('python', get_default_variant(config)['python'])
+        if int(py_ver[0]) >= 3:
+            if int(py_ver.split('.')[1]) < 5:
+                version = '10.0'
             version = '14.0'
-        elif config.PY3K:
-            version = '10.0'
         else:
             version = '9.0'
 
@@ -98,10 +134,10 @@ def msvc_env_cmd(bits, config, override=None):
     msvc_env_lines.append('set "VS_MAJOR={}"'.format(version.split('.')[0]))
     msvc_env_lines.append('set "VS_YEAR={}"'.format(VS_VERSION_STRING[version][-4:]))
     msvc_env_lines.append('set "CMAKE_GENERATOR={}"'.format(VS_VERSION_STRING[version] +
-                                                            {64: ' Win64', 32: ''}[bits]))
+                                                            {'64': ' Win64', '32': ''}[bits]))
     # tell msys2 to ignore path conversions for issue-causing windows-style flags in build
     #   See https://github.com/conda-forge/icu-feedstock/pull/5
-    msvc_env_lines.append('set "MSYS2_ARG_CONV_EXCL=/AI;/AL;/OUT;/out;%MSYS2_ARG_CONV_EXCL%"')
+    msvc_env_lines.append('set "MSYS2_ARG_CONV_EXCL=/AI;/AL;/OUT;/out"')
     msvc_env_lines.append('set "MSYS2_ENV_CONV_EXCL=CL"')
     if version == '10.0':
         try:
@@ -109,7 +145,7 @@ def msvc_env_cmd(bits, config, override=None):
                                             'installationfolder')
             WIN_SDK_71_BAT_PATH = os.path.join(WIN_SDK_71_PATH, 'Bin', 'SetEnv.cmd')
 
-            win_sdk_arch = '/Release /x86' if bits == 32 else '/Release /x64'
+            win_sdk_arch = '/Release /x86' if bits == '32' else '/Release /x64'
             win_sdk_cmd = build_vcvarsall_cmd(WIN_SDK_71_BAT_PATH, arch=win_sdk_arch)
 
             # There are two methods of building Python 3.3 and 3.4 extensions (both
@@ -143,7 +179,7 @@ def msvc_env_cmd(bits, config, override=None):
         except (KeyError, TypeError):
             VCVARS64_VS9_BAT_PATH = None
 
-        error1 = 'if errorlevel 1 {}'
+        error1 = 'IF %ERRORLEVEL% NEQ 0 {}'
 
         # Prefer VS9 proper over Microsoft Visual C++ Compiler for Python 2.7
         msvc_env_lines.append(build_vcvarsall_cmd(vcvarsall_vs_path))
@@ -165,17 +201,54 @@ def msvc_env_cmd(bits, config, override=None):
     return '\n'.join(msvc_env_lines) + '\n'
 
 
-def build(m, bld_bat, config):
-    with path_prepended(config.build_prefix):
-        env = environ.get_dict(config=config, m=m)
+def _write_bat_activation_text(file_handle, m):
+    if m.is_cross:
+        # HACK: we need both build and host envs "active" - i.e. on PATH,
+        #     and with their activate.d scripts sourced. Conda only
+        #     lets us activate one, though. This is a
+        #     vile hack to trick conda into "stacking"
+        #     two environments.
+        #
+        # Net effect: binaries come from host first, then build
+        #
+        # Conda 4.4 may break this by reworking the activate scripts.
+        #  ^^ shouldn't be true
+        # In conda 4.4, export CONDA_MAX_SHLVL=2 to stack envs to two
+        #   levels deep.
+        # conda 4.4 does require that a conda-meta/history file
+        #   exists to identify a valid conda environment
+        history_file = join(m.config.host_prefix, 'conda-meta', 'history')
+        if not isfile(history_file):
+            if not isdir(dirname(history_file)):
+                os.makedirs(dirname(history_file))
+            open(history_file, 'a').close()
+        file_handle.write('call "{conda_root}\\activate.bat" "{prefix}"\n'.format(
+            conda_root=root_script_dir,
+            prefix=m.config.host_prefix))
+        # removing this placeholder should make conda double-activate with conda 4.3
+        file_handle.write('set "PATH=%PATH:CONDA_PATH_PLACEHOLDER;=%"\n')
+        file_handle.write('set CONDA_MAX_SHLVL=2\n')
+    # Write build prefix activation AFTER host prefix, so that its executables come first
+    file_handle.write('call "{conda_root}\\activate.bat" "{prefix}"\n'.format(
+        conda_root=root_script_dir,
+        prefix=m.config.build_prefix))
+
+
+def build(m, bld_bat, stats):
+    with path_prepended(m.config.build_prefix):
+        with path_prepended(m.config.host_prefix):
+            env = environ.get_dict(config=m.config, m=m)
     env["CONDA_BUILD_STATE"] = "BUILD"
+
+    # set variables like CONDA_PY in the test environment
+    env.update(set_language_env_vars(m.config.variant))
 
     for name in 'BIN', 'INC', 'LIB':
         path = env['LIBRARY_' + name]
         if not isdir(path):
             os.makedirs(path)
 
-    src_dir = config.work_dir
+    src_dir = m.config.work_dir
     if os.path.isfile(bld_bat):
         with open(bld_bat) as fi:
             data = fi.read()
@@ -183,19 +256,21 @@ def build(m, bld_bat, config):
             # more debuggable with echo on
             fo.write('@echo on\n')
             for key, value in env.items():
-                fo.write('set "{key}={value}"\n'.format(key=key, value=value))
-            fo.write(msvc_env_cmd(bits=bits, config=config,
-                                  override=m.get_value('build/msvc_compiler', None)))
+                if value:
+                    fo.write('set "{key}={value}"\n'.format(key=key, value=value))
+            if not m.uses_new_style_compiler_activation:
+                fo.write(msvc_env_cmd(bits=m.config.host_arch, config=m.config,
+                                    override=m.get_value('build/msvc_compiler', None)))
             # Reset echo on, because MSVC scripts might have turned it off
             fo.write('@echo on\n')
             fo.write('set "INCLUDE={};%INCLUDE%"\n'.format(env["LIBRARY_INC"]))
             fo.write('set "LIB={};%LIB%"\n'.format(env["LIBRARY_LIB"]))
-            if config.activate:
-                fo.write("call {conda_root}\\activate.bat {prefix}\n".format(
-                    conda_root=root_script_dir,
-                    prefix=config.build_prefix))
+            if m.config.activate and m.name() != 'conda':
+                _write_bat_activation_text(fo, m)
             fo.write("REM ===== end generated header =====\n")
             fo.write(data)
 
         cmd = ['cmd.exe', '/c', 'bld.bat']
-        _check_call(cmd, cwd=src_dir)
+        check_call_env(cmd, cwd=src_dir, stats=stats)
+
+    fix_staged_scripts(join(m.config.host_prefix, 'Scripts'), config=m.config)

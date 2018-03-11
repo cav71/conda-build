@@ -1,6 +1,6 @@
 package:
   name: conda-build
-  version: {{ GIT_DESCRIBE_TAG }}
+  version: {{ GIT_DESCRIBE_TAG }}.{{ GIT_BUILD_STR }}
 
 source:
   git_url: ../
@@ -15,21 +15,31 @@ build:
     - conda-inspect = conda_build.cli.main_inspect:main
     - conda-metapackage = conda_build.cli.main_metapackage:main
     - conda-render = conda_build.cli.main_render:main
-    - conda-sign = conda_build.cli.main_sign:main
     - conda-skeleton = conda_build.cli.main_skeleton:main
 
 requirements:
   build:
+    - git
     - python
+    - setuptools
   run:
-    - conda  >=4.1
+    - beautifulsoup4
+    - chardet
+    - conda  >=4.3
+    - conda-verify
+    - contextlib2   # [py<34]
+    - enum34        # [py<34]
     - filelock
+    - futures       # [py<3]
     - jinja2
-    - patchelf      [linux]
-    - pycrypto
+    - patchelf      # [linux]
+    - pkginfo
+    - psutil
     - python
     - pyyaml
-    - pkginfo
+    - scandir       # [py<34]
+    - six
+    - glob2
 
 test:
   requires:
@@ -40,33 +50,30 @@ test:
     # - pytest-xdist
     - mock
   commands:
-    - which conda-build  # [unix]
+    - type -P conda-build  # [unix]
     - where conda-build  # [win]
     - conda build -h
-    - which conda-convert  # [unix]
+    - type -P conda-convert  # [unix]
     - where conda-convert  # [win]
     - conda convert -h
-    - which conda-develop  # [unix]
+    - type -P conda-develop  # [unix]
     - where conda-develop  # [win]
     - conda develop -h
-    - which conda-index  # [unix]
+    - type -P conda-index  # [unix]
     - where conda-index  # [win]
     - conda index -h
-    - which conda-inspect  # [unix]
+    - type -P conda-inspect  # [unix]
     - where conda-inspect  # [win]
     - conda inspect -h
     - conda inspect linkages -h \| grep "--name ENVIRONMENT"  # [unix]
     - conda inspect objects -h \| grep "--name ENVIRONMENT"   # [osx]
-    - which conda-metapackage  # [unix]
+    - type -P conda-metapackage  # [unix]
     - where conda-metapackage  # [win]
     - conda metapackage -h
-    - which conda-render  # [unix]
+    - type -P conda-render  # [unix]
     - where conda-render  # [win]
     - conda render -h
-    - which conda-sign  # [unix]
-    - where conda-sign  # [win]
-    - conda sign -h
-    - which conda-skeleton  # [unix]
+    - type -P conda-skeleton  # [unix]
     - where conda-skeleton  # [win]
     - conda skeleton -h
     # test that conda sees entry points appropriately in help
@@ -75,6 +82,10 @@ test:
     - conda_build
   source_files:
     - tests
+
+outputs:
+  - type: wheel
+  - name: {{ PKG_NAME }}
 
 about:
   home: https://github.com/conda/conda-build
